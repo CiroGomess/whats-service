@@ -1,0 +1,15 @@
+{
+  "name": "hemoalerta-whatsapp-service",
+  "version": "1.0.0",
+  "description": "Serviço de WhatsApp Venom-Bot para HemoAlerta",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@wppconnect/wa-js": "^4.6.0",
+    "cors": "^2.8.5",
+    "express": "^4.19.2",
+    "venom-bot": "^5.1.0"
+  }
+}
