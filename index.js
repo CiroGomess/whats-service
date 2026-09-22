@@ -311,12 +311,13 @@ app.get('/qrcode', (req, res) => {
 
 // Página simples para escanear o QR direto no navegador (atualiza a cada 3s)
 app.get('/qr', (req, res) => {
-  if (!client && !isStarting && currentStatus !== 'CONNECTED') startVenomSession();
   const body = currentStatus === 'CONNECTED'
     ? '<h2>✅ WhatsApp conectado!</h2>'
     : currentQrCode
       ? `<h2>Escaneie no WhatsApp → Aparelhos conectados</h2><img src="${currentQrCode}" style="width:300px;height:300px">`
-      : `<h2>⏳ Gerando QR Code... (${currentStatus})</h2>${lastError ? `<p>${lastError}</p>` : ''}`;
+      : currentStatus === 'DISCONNECTED'
+        ? '<h2>WhatsApp desconectado</h2><p>Clique em "Conectar WhatsApp via QR Code" no painel admin.</p>'
+        : `<h2>⏳ Gerando QR Code... (${currentStatus})</h2>${lastError ? `<p>${lastError}</p>` : ''}`;
   res.send(`<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="refresh" content="3">
 <title>HemoAlerta WhatsApp</title></head>
 <body style="font-family:sans-serif;text-align:center;padding:40px">${body}
@@ -724,6 +725,6 @@ app.post('/broadcast', async (req, res) => {
 
 app.listen(PORT, () => {
   console.log(`🩸 [HemoAlerta] Serviço WhatsApp Venom rodando na porta ${PORT} (${WHATS_SERVICE_URL})`);
-  // Inicia automaticamente o Venom ao iniciar o servidor para restaurar sessão existente
-  startVenomSession();
+  // Venom NÃO inicia sozinho: a pasta tokens/ só é criada quando o painel admin
+  // pedir a conexão (POST /connect) ou em /reset.
 });
