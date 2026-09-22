@@ -164,6 +164,20 @@ function startVenomSession() {
       browserInstance: (browser, page) => {
         browserRef = browser;
         watchQrCanvas(page);
+        // Log de diagnóstico: Chromium morreu (normalmente falta de RAM)
+        browser.on('disconnected', () => {
+          const mb = Math.round(process.memoryUsage().rss / 1024 / 1024);
+          console.warn(`[Venom] ⚠️ Chromium encerrado (status anterior: ${currentStatus}, RAM Node: ${mb}MB). Se aconteceu sozinho, provavelmente faltou memória.`);
+          if (browserRef === browser) {
+            browserRef = null;
+            client = null;
+            isStarting = false;
+            currentStatus = 'DISCONNECTED';
+            currentQrCode = null;
+            lastError = 'Navegador do WhatsApp encerrou (possível falta de memória). Clique em Conectar.';
+          }
+        });
+        page.on('error', (err) => console.warn('[Venom] ⚠️ Página do WhatsApp travou:', err && err.message));
       },
       catchQR: (base64Qr, asciiQR, attempts, urlCode) => {
         console.log(`[Venom] Novo QR Code capturado (tentativa ${attempts}).`);
@@ -184,7 +198,7 @@ function startVenomSession() {
           statusSession === 'notLogged' ||
           statusSession === 'waitForLogin'
         ) {
-          currentStatus = currentQrCode ? 'QRCODE_READY' : 'STARTING';
+          if (currentStatus !== 'CONNECTED') currentStatus = currentQrCode ? 'QRCODE_READY' : 'STARTING';
         } else if (statusSession === 'qrReadSuccess') {
           // QR lido pelo celular: WhatsApp Web está sincronizando
           currentStatus = 'STARTING';
@@ -192,7 +206,8 @@ function startVenomSession() {
         } else if (statusSession === 'desconnectedMobile' || statusSession === 'desconnected') {
           // Venom emite isso na própria tela de QR (socket ainda não conectado).
           // Não é logout real: só aguarda o QR Code aparecer.
-          if (!currentQrCode) currentStatus = 'STARTING';
+          // Oscilação do socket depois de conectado também dispara isso: ignora.
+          if (!currentQrCode && currentStatus !== 'CONNECTED') currentStatus = 'STARTING';
         } else if (statusSession === 'noOpenBrowser' || statusSession === 'initBrowserError') {
           currentStatus = 'ERROR';
           lastError = 'Falha ao abrir o navegador Chromium no servidor.';
@@ -252,6 +267,7 @@ function startVenomSession() {
           // Outra aba do WhatsApp Web abriu: retoma o controle
           cli.useHere().catch(() => {});
         } else if (state === 'UNPAIRED' || state === 'UNPAIRED_IDLE') {
+          console.warn(`[Venom] ⚠️ Aparelho desvinculado (${state}). Gerando novo QR...`);
           // Deslogado pelo celular: o próprio Venom gera um QR novo (catchQR)
           currentStatus = 'STARTING';
           currentQrCode = null;
@@ -326,6 +342,7 @@ app.get('/qr', (req, res) => {
 
 // Iniciar conexão com WhatsApp (dispara geração do QR)
 app.post('/connect', (req, res) => {
+  console.log(`[API] /connect recebido (status atual: ${currentStatus})`);
   if (currentStatus === 'CONNECTED' && client) {
     return res.json({ success: true, message: 'Já conectado ao WhatsApp!' });
   }
@@ -339,6 +356,7 @@ app.post('/connect', (req, res) => {
 
 // Desconectar do WhatsApp
 app.post('/disconnect', async (req, res) => {
+  console.log(`[API] /disconnect recebido (status atual: ${currentStatus})`);
   await closeClientSafely();
   isStarting = false;
   currentStatus = 'DISCONNECTED';
