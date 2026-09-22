@@ -75,20 +75,52 @@ function formatPhoneNumber(phone) {
   return cleaned;
 }
 
+const SESSION_NAME = 'hemoalerta-whatsapp';
+const TOKENS_DIR = path.join(__dirname, 'tokens');
+const SESSION_DIR = path.join(TOKENS_DIR, SESSION_NAME);
+let isStarting = false; // trava: impede vários Chromium abrindo no mesmo perfil
+
+// Remove travas do Chromium deixadas por um processo que morreu (restart/crash)
+function clearChromiumLocks() {
+  for (const f of ['SingletonLock', 'SingletonCookie', 'SingletonSocket']) {
+    try { fs.rmSync(path.join(SESSION_DIR, f), { force: true }); } catch (e) {}
+  }
+}
+
+// Sessão inválida (deslogado pelo celular): apaga tokens para gerar QR novo
+function clearSessionTokens() {
+  try { fs.rmSync(SESSION_DIR, { recursive: true, force: true }); } catch (e) {}
+}
+
+async function closeClientSafely() {
+  const cli = client;
+  client = null;
+  deviceInfo = null;
+  if (cli) {
+    try { await cli.close(); } catch (e) {}
+  }
+}
+
 function startVenomSession() {
   if (currentStatus === 'CONNECTED' && client) {
     console.log('[Venom] Sessão já está ativa e conectada.');
     return;
   }
+  if (isStarting) {
+    console.log('[Venom] Inicialização já em andamento, ignorando nova chamada.');
+    return;
+  }
 
+  isStarting = true;
   currentStatus = 'STARTING';
   currentQrCode = null;
   lastError = null;
+  clearChromiumLocks();
   console.log('[Venom] Iniciando navegador e sessão Venom...');
 
   venom
     .create({
-      session: 'hemoalerta-whatsapp',
+      session: SESSION_NAME,
       catchQR: (base64Qr, asciiQR, attempts, urlCode) => {
         console.log(`[Venom] Novo QR Code capturado (tentativa ${attempts}).`);
         currentQrCode = base64Qr;
@@ -100,7 +132,8 @@ function startVenomSession() {
           statusSession === 'isLogged' ||
           statusSession === 'chatsAvailable' ||
           statusSession === 'successChat' ||
-          statusSession === 'inChat'
+          statusSession === 'inChat' ||
+          statusSession === 'qrReadSuccess'
         ) {
           currentStatus = 'CONNECTED';
           currentQrCode = null;
@@ -108,11 +141,17 @@ function startVenomSession() {
           statusSession === 'notLogged' ||
           statusSession === 'waitForLogin'
         ) {
-          if (!currentQrCode) {
-            currentStatus = 'STARTING';
-          } else {
-            currentStatus = 'QRCODE_READY';
-          }
+          currentStatus = currentQrCode ? 'QRCODE_READY' : 'STARTING';
+        } else if (statusSession === 'desconnectedMobile' || statusSession === 'deleteToken') {
+          // Celular desconectou o aparelho: token velho não serve mais
+          currentStatus = 'DISCONNECTED';
+          currentQrCode = null;
+          lastError = 'Sessão encerrada pelo celular. Clique em Conectar para gerar novo QR Code.';
+          isStarting = false;
+          closeClientSafely().finally(clearSessionTokens);
+        } else if (statusSession === 'noOpenBrowser' || statusSession === 'initBrowserError') {
+          currentStatus = 'ERROR';
+          lastError = 'Falha ao abrir o navegador Chromium no servidor.';
         } else if (
           statusSession === 'browserClose' ||
           statusSession === 'autocloseCalled' ||
@@ -124,26 +163,31 @@ function startVenomSession() {
       },
       autoClose: 0,
       options: {
-        headless: process.env.HEADLESS !== undefined 
-          ? (process.env.HEADLESS === 'true' || process.env.HEADLESS === 'new' ? 'new' : false)
-          : (process.platform === 'linux' || process.env.NODE_ENV === 'production' || !process.env.DISPLAY ? 'new' : false),
+        headless: process.platform === 'win32' ? false : 'new',
         devtools: false,
         useChrome: process.platform === 'win32',
         debug: false,
-        logQR: true,
+        logQR: false,
         browserArgs: [
           '--no-sandbox',
           '--disable-setuid-sandbox',
           '--disable-dev-shm-usage',
-          '--no-first-run',
           '--disable-gpu',
-          '--no-zygote',
-          '--single-process'
+          '--disable-extensions',
+          '--disable-background-networking',
+          '--disable-default-apps',
+          '--disable-sync',
+          '--disable-translate',
+          '--mute-audio',
+          '--no-first-run',
+          '--no-default-browser-check',
+          '--js-flags=--max-old-space-size=256'
         ]
       }
     })
     .then(async (cli) => {
       client = cli;
+      isStarting = false;
       currentStatus = 'CONNECTED';
       currentQrCode = null;
       console.log('[Venom] Cliente conectado com sucesso!');
@@ -160,18 +204,23 @@ function startVenomSession() {
         if (state === 'CONNECTED') {
           currentStatus = 'CONNECTED';
           currentQrCode = null;
-        } else if (state === 'CONFLICT' || state === 'UNPAIRED') {
+        } else if (state === 'CONFLICT') {
+          // Outra aba do WhatsApp Web abriu: retoma o controle
+          cli.useHere().catch(() => {});
+        } else if (state === 'UNPAIRED' || state === 'UNPAIRED_IDLE') {
           currentStatus = 'DISCONNECTED';
-          client = null;
-          deviceInfo = null;
+          closeClientSafely().finally(clearSessionTokens);
         }
       });
     })
     .catch((err) => {
       console.error('[Venom] Erro ao iniciar sessão:', err);
-      currentStatus = 'ERROR';
-      lastError = err.message || String(err);
-      client = null;
+      isStarting = false;
+      if (currentStatus !== 'DISCONNECTED') {
+        currentStatus = 'ERROR';
+        lastError = (err && err.message) || String(err);
+      }
+      closeClientSafely();
     });
 }
 
@@ -210,6 +259,9 @@ app.post('/connect', (req, res) => {
   if (currentStatus === 'CONNECTED' && client) {
     return res.json({ success: true, message: 'Já conectado ao WhatsApp!' });
   }
+  if (isStarting) {
+    return res.json({ success: true, message: 'Venom já está iniciando... aguarde o QR Code.' });
+  }
 
   startVenomSession();
   res.json({ success: true, message: 'Inicializando Venom... O QR Code estará disponível em instantes.' });
@@ -217,41 +269,21 @@ app.post('/connect', (req, res) => {
 
 // Desconectar do WhatsApp
 app.post('/disconnect', async (req, res) => {
-  try {
-    if (client) {
-      await client.close();
-    }
-  } catch (e) {
-    console.error('[Venom] Erro ao fechar cliente:', e);
-  } finally {
-    client = null;
-    currentStatus = 'DISCONNECTED';
-    currentQrCode = null;
-    deviceInfo = null;
-  }
+  await closeClientSafely();
+  isStarting = false;
+  currentStatus = 'DISCONNECTED';
+  currentQrCode = null;
   res.json({ success: true, message: 'Sessão do WhatsApp desconectada.' });
 });
 
 // Resetar tokens e sessão
 app.post('/reset', async (req, res) => {
-  try {
-    if (client) {
-      await client.close();
-    }
-  } catch (e) {}
-  client = null;
+  await closeClientSafely();
+  isStarting = false;
   currentStatus = 'DISCONNECTED';
   currentQrCode = null;
-  deviceInfo = null;
-
-  try {
-    const tokensPath = path.join(__dirname, 'tokens');
-    if (fs.existsSync(tokensPath)) {
-      fs.rmSync(tokensPath, { recursive: true, force: true });
-    }
-  } catch (err) {
-    console.warn('[Venom] Aviso ao limpar tokens:', err.message);
-  }
+  lastError = null;
+  clearSessionTokens();
 
   res.json({ success: true, message: 'Sessão e tokens resetados com sucesso.' });
 });
