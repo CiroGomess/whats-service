@@ -7,8 +7,47 @@ const path = require('path');
 const app = express();
 const PORT = process.env.PORT || 8001;
 
-app.use(cors());
-app.use(express.json());
+const allowedOrigins = [
+  'https://hemoalert.squareweb.app',
+  'http://hemoalert.squareweb.app',
+  'https://backendhemoalert.squareweb.app',
+  'http://backendhemoalert.squareweb.app',
+  'https://whatsservicehemoalert.squareweb.app',
+  'http://whatsservicehemoalert.squareweb.app',
+  'http://localhost:3000',
+  'http://localhost:8000',
+  'http://localhost:8001',
+  'http://127.0.0.1:3000',
+  'http://127.0.0.1:8000',
+  'http://127.0.0.1:8001'
+];
+
+app.use(cors({
+  origin: (origin, callback) => {
+    if (!origin || allowedOrigins.includes(origin) || origin.endsWith('.squareweb.app')) {
+      return callback(null, true);
+    }
+    return callback(null, true);
+  },
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'Accept']
+}));
+
+app.use(express.json({ limit: '15mb' }));
+
+// Health check para monitoramento e hosting Square Cloud
+app.get('/', (req, res) => {
+  res.json({
+    service: '🩸 HemoAlerta WhatsApp Service',
+    status: currentStatus,
+    timestamp: new Date().toISOString()
+  });
+});
+
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok', whatsapp: currentStatus });
+});
 
 let client = null;
 let currentQrCode = null;
@@ -80,16 +119,21 @@ function startVenomSession() {
       },
       autoClose: 0,
       options: {
-        headless: false, // Abre janela visível para que o WhatsApp Web carregue o QR Code sem bloqueio anti-bot
+        headless: process.env.HEADLESS !== undefined 
+          ? (process.env.HEADLESS === 'true' || process.env.HEADLESS === 'new' ? 'new' : false)
+          : (process.platform === 'linux' || process.env.NODE_ENV === 'production' || !process.env.DISPLAY ? 'new' : false),
         devtools: false,
-        useChrome: true,
+        useChrome: process.platform === 'win32',
         debug: false,
         logQR: true,
         browserArgs: [
           '--no-sandbox',
           '--disable-setuid-sandbox',
           '--disable-dev-shm-usage',
-          '--no-first-run'
+          '--no-first-run',
+          '--disable-gpu',
+          '--no-zygote',
+          '--single-process'
         ]
       }
     })
@@ -338,14 +382,33 @@ async function ensureWPP(cli) {
 // Função auxiliar para envio seguro e garantido (com suporte opcional a imagem/arte com legenda)
 async function sendMessageReliably(targetJid, text, imagePath = null) {
   let imageBase64Url = null;
-  if (imagePath && fs.existsSync(imagePath)) {
-    try {
-      const ext = path.extname(imagePath).toLowerCase();
-      const mime = ext === '.png' ? 'image/png' : 'image/jpeg';
-      const fileData = fs.readFileSync(imagePath);
-      imageBase64Url = `data:${mime};base64,${fileData.toString('base64')}`;
-    } catch (eImg) {
-      console.warn('[WPP] Aviso ao ler imagem:', eImg.message);
+  const localArt = path.join(__dirname, 'art.jpeg');
+  const targetImage = imagePath || (fs.existsSync(localArt) ? localArt : 'https://hemoalert.squareweb.app/art.jpeg');
+
+  if (targetImage) {
+    if (targetImage.startsWith('data:')) {
+      imageBase64Url = targetImage;
+    } else if (targetImage.startsWith('http://') || targetImage.startsWith('https://')) {
+      try {
+        const resp = await fetch(targetImage);
+        if (resp.ok) {
+          const arrBuffer = await resp.arrayBuffer();
+          const buf = Buffer.from(arrBuffer);
+          const mime = targetImage.toLowerCase().endsWith('.png') ? 'image/png' : 'image/jpeg';
+          imageBase64Url = `data:${mime};base64,${buf.toString('base64')}`;
+        }
+      } catch (eUrl) {
+        console.warn('[WPP] Falha ao baixar arte via URL:', eUrl.message);
+      }
+    } else if (fs.existsSync(targetImage)) {
+      try {
+        const ext = path.extname(targetImage).toLowerCase();
+        const mime = ext === '.png' ? 'image/png' : 'image/jpeg';
+        const fileData = fs.readFileSync(targetImage);
+        imageBase64Url = `data:${mime};base64,${fileData.toString('base64')}`;
+      } catch (eImg) {
+        console.warn('[WPP] Aviso ao ler imagem:', eImg.message);
+      }
     }
   }
 
