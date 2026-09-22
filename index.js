@@ -5,15 +5,19 @@ const fs = require('fs');
 const path = require('path');
 
 const app = express();
-const PORT = process.env.PORT || 8001;
+// URLs de produção (Square Cloud) — fixas, sem .env
+const FRONTEND_URL = 'https://hemoalert.squareweb.app';
+const BACKEND_URL = 'https://backendhemoalert.squareweb.app';
+const WHATS_SERVICE_URL = 'https://whatsservicehemoalert.squareweb.app';
+const PROD_ART_URL = `${FRONTEND_URL}/art.jpeg`;
+
+// Square Cloud exige porta 80 (Linux); localmente usa 8001
+const PORT = process.env.PORT || (process.platform === 'linux' ? 80 : 8001);
 
 const allowedOrigins = [
-  'https://hemoalert.squareweb.app',
-  'http://hemoalert.squareweb.app',
-  'https://backendhemoalert.squareweb.app',
-  'http://backendhemoalert.squareweb.app',
-  'https://whatsservicehemoalert.squareweb.app',
-  'http://whatsservicehemoalert.squareweb.app',
+  FRONTEND_URL,
+  BACKEND_URL,
+  WHATS_SERVICE_URL,
   'http://localhost:3000',
   'http://localhost:8000',
   'http://localhost:8001',
@@ -24,10 +28,11 @@ const allowedOrigins = [
 
 app.use(cors({
   origin: (origin, callback) => {
-    if (!origin || allowedOrigins.includes(origin) || origin.endsWith('.squareweb.app')) {
+    // Sem origin = chamada servidor-a-servidor (backend Python) → liberado
+    if (!origin || allowedOrigins.includes(origin) || /^https:\/\/[a-z0-9-]+\.squareweb\.app$/.test(origin)) {
       return callback(null, true);
     }
-    return callback(null, true);
+    return callback(null, false);
   },
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
@@ -380,10 +385,22 @@ async function ensureWPP(cli) {
 }
 
 // Função auxiliar para envio seguro e garantido (com suporte opcional a imagem/arte com legenda)
-async function sendMessageReliably(targetJid, text, imagePath = null) {
+async function sendMessageReliably(targetJid, text, imagePath = null, sendArt = true) {
   let imageBase64Url = null;
   const localArt = path.join(__dirname, 'art.jpeg');
-  const targetImage = imagePath || (fs.existsSync(localArt) ? localArt : 'https://hemoalert.squareweb.app/art.jpeg');
+  let targetImage = null;
+  if (sendArt) {
+    if (imagePath && (imagePath.startsWith('data:') || fs.existsSync(imagePath))) {
+      targetImage = imagePath;
+    } else if (fs.existsSync(localArt)) {
+      // Arte oficial local: evita baixar a mesma imagem a cada mensagem
+      targetImage = localArt;
+    } else if (imagePath && /^https?:\/\//.test(imagePath)) {
+      targetImage = imagePath;
+    } else {
+      targetImage = PROD_ART_URL;
+    }
+  }
 
   if (targetImage) {
     if (targetImage.startsWith('data:')) {
@@ -468,10 +485,10 @@ async function sendMessageReliably(targetJid, text, imagePath = null) {
 
   // 2. Fallback de envio alternativo
   await bypassMarkedUnread(client);
-  if (imagePath && fs.existsSync(imagePath) && client.sendImage) {
+  if (targetImage && !targetImage.startsWith('data:') && !/^https?:\/\//.test(targetImage) && client.sendImage) {
     try {
       console.log(`[Venom Fallback] Enviando imagem via client.sendImage para ${targetJid}...`);
-      return await client.sendImage(targetJid, imagePath, 'art.jpeg', text);
+      return await client.sendImage(targetJid, targetImage, 'art.jpeg', text);
     } catch (eVenomImg) {
       console.warn('[Venom Fallback] Falha em sendImage:', eVenomImg.message);
     }
@@ -506,7 +523,7 @@ async function sendMessageReliably(targetJid, text, imagePath = null) {
 
 // Disparar mensagem para um número
 app.post('/send', async (req, res) => {
-  const { to, message, imagePath } = req.body;
+  const { to, message, imagePath, sendArt = true } = req.body;
 
   if (!client || currentStatus !== 'CONNECTED') {
     return res.status(400).json({
@@ -526,7 +543,7 @@ app.post('/send', async (req, res) => {
 
   try {
     console.log(`[Venom] Enviando mensagem para ${targetJid}...`);
-    const result = await sendMessageReliably(targetJid, message, imagePath);
+    const result = await sendMessageReliably(targetJid, message, imagePath, sendArt);
     console.log(`[Venom] Mensagem enviada com sucesso para ${targetJid}!`);
     return res.json({
       success: true,
@@ -544,7 +561,7 @@ app.post('/send', async (req, res) => {
 
 // Disparar mensagens em lote (Broadcast para doadores com delay seguro e imagem opcional)
 app.post('/broadcast', async (req, res) => {
-  const { recipients, message, imagePath } = req.body;
+  const { recipients, message, imagePath, sendArt = true } = req.body;
 
   if (!client || currentStatus !== 'CONNECTED') {
     return res.status(400).json({
@@ -567,7 +584,7 @@ app.post('/broadcast', async (req, res) => {
     const donor = recipients[i];
     const phone = donor.whatsapp || donor.telefone || donor.numero;
     const name = donor.nome || donor.nomeCompleto || 'Doador(a)';
-    const customMessage = message.replace('{nome}', name);
+    const customMessage = message.split('{nome}').join(name);
 
     const targetJid = formatPhoneNumber(phone);
     if (!targetJid) {
@@ -577,7 +594,7 @@ app.post('/broadcast', async (req, res) => {
 
     try {
       console.log(`[Venom Broadcast] (${i + 1}/${recipients.length}) Enviando para ${name} (${targetJid})...`);
-      await sendMessageReliably(targetJid, customMessage, imagePath);
+      await sendMessageReliably(targetJid, customMessage, imagePath, sendArt);
       sentCount++;
       // Intervalo seguro entre envios (1,8s) para respeitar anti-spam e garantir envio do socket
       await new Promise((r) => setTimeout(r, 1800));
@@ -600,7 +617,7 @@ app.post('/broadcast', async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`🩸 [HemoAlerta] Serviço WhatsApp Venom rodando em http://localhost:${PORT}`);
+  console.log(`🩸 [HemoAlerta] Serviço WhatsApp Venom rodando na porta ${PORT} (${WHATS_SERVICE_URL})`);
   // Inicia automaticamente o Venom ao iniciar o servidor para restaurar sessão existente
   startVenomSession();
 });
